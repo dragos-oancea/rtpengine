@@ -257,11 +257,22 @@ void cc_cleanup(void) {
 
 static codec_cc_state cc_run(codec_cc_t *c, const str *data, unsigned long ts, void *async_cb_obj) {
 	AVPacket *pkt = c->avpkt;
+	int out_capacity = pkt->size; // buffer size handed to the runner as output space
 	ssize_t ret = cc_runner_do(c->runner, c->codec,
 			(unsigned char *) data->s, data->len,
 			pkt->data, pkt->size);
 	if (ret <= 0)
 		return CCC_ERR;
+	if (ret > out_capacity) {
+		// the helper daemon reported more output than the buffer holds; a
+		// version/protocol mismatch could do this. refuse to propagate a
+		// bogus length (and treat an actual overrun as fatal rather than
+		// shipping over-read data downstream).
+		ilog(LOG_ERR | LOG_FLAG_LIMIT,
+				"codec-chain returned oversized output (%zd > %d bytes), dropping frame",
+				ret, out_capacity);
+		return CCC_ERR;
+	}
 	// XXX handle input frame sizes != 160
 
 	pkt->size = ret;
@@ -432,6 +443,14 @@ static void cc_run_callback(void *p, ssize_t size) {
 	codec_cc_t *c = p;
 
 	AVPacket *pkt = c->avpkt_async;
+
+	// pkt->size still holds the output-buffer capacity set in __cc_run_async()
+	if (size >= 0 && size > pkt->size) {
+		ilog(LOG_ERR | LOG_FLAG_LIMIT,
+				"codec-chain returned oversized output (%zd > %d bytes), dropping frame",
+				size, pkt->size);
+		size = -1; // fall through as an error: callback gets a NULL packet
+	}
 
 	if (size >= 0) {
 		pkt->size = size;
