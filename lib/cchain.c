@@ -415,9 +415,24 @@ static void cc_X_pkt_callback(codec_cc_t *c, ssize_t size, __typeof__(__cc_run_a
 
 	if (j) {
 		if (!run_async(c, &j->data, j->ts, j->async_cb_obj)) {
-			LOCK(&c->async_lock);
-			t_queue_push_head(&c->async_jobs, j);
-			c->async_blocked = true;
+			// couldn't submit (no free context). normally we park as
+			// blocked and wait for the next input to retry. but if a
+			// shutdown is pending there will be no further input and no
+			// in-flight job to call back, so parking would leak the
+			// codec_cc_t and every queued job (and its held refs)
+			// forever. tear down instead: __codec_cc_free() drains the
+			// queue, firing each job's callback with a NULL packet.
+			bool shutdown_now;
+			{
+				LOCK(&c->async_lock);
+				t_queue_push_head(&c->async_jobs, j);
+				c->async_blocked = true;
+				shutdown_now = c->async_shutdown;
+			}
+			if (shutdown_now) {
+				__codec_cc_free(c);
+				return;
+			}
 		}
 		else {
 			g_free(j->data.s);
